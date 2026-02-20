@@ -66,6 +66,9 @@ module.exports = (_ => {
 						showFolderLink: {value: false}
 					}
 				};
+				// Track active observers and timeouts for cleanup
+				this.activeObservers = [];
+				this.activeTimeouts = [];
 			}
 			
 			onStart () {
@@ -76,6 +79,25 @@ module.exports = (_ => {
 					this.settings.general.savePath = userProfile ? path.join(userProfile, "Downloads") : "Downloads";
 					this.saveSettings();
 				}
+			}
+
+			onStop () {
+				// Clean up all active MutationObservers
+				this.activeObservers.forEach(observer => observer.disconnect());
+				this.activeObservers = [];
+				
+				// Clear all active timeouts
+				this.activeTimeouts.forEach(timeout => clearTimeout(timeout));
+				this.activeTimeouts = [];
+				
+				// Remove any injected folder links from the DOM
+				document.querySelectorAll("a[data-saveallfiles-link]").forEach(link => {
+					const textNode = link.previousSibling;
+					if (textNode && textNode.textContent === " to ") {
+						textNode.remove();
+					}
+					link.remove();
+				});
 			}
 
 			getSavePath() {
@@ -383,15 +405,27 @@ module.exports = (_ => {
 					
 					// Watch for DOM changes and try multiple times since toasts appear asynchronously
 					const observer = new MutationObserver(() => {
-						if (tryAddLink()) observer.disconnect();
+						if (tryAddLink()) {
+							observer.disconnect();
+							const index = this.activeObservers.indexOf(observer);
+							if (index > -1) this.activeObservers.splice(index, 1);
+						}
 					});
 					
+					this.activeObservers.push(observer);
 					observer.observe(document.body, { childList: true, subtree: true });
 					
 					[0, 100, 300, 500, 2000].forEach(delay => {
-						setTimeout(() => {
-							if (tryAddLink() || delay === 2000) observer.disconnect();
+						const timeout = setTimeout(() => {
+							if (tryAddLink() || delay === 2000) {
+								observer.disconnect();
+								const index = this.activeObservers.indexOf(observer);
+								if (index > -1) this.activeObservers.splice(index, 1);
+							}
+							const timeoutIndex = this.activeTimeouts.indexOf(timeout);
+							if (timeoutIndex > -1) this.activeTimeouts.splice(timeoutIndex, 1);
 						}, delay);
+						this.activeTimeouts.push(timeout);
 					});
 				};
 				
