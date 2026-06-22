@@ -1,8 +1,8 @@
 /**
  * @name SaveAllFiles
  * @author funnything1
- * @version 1.0.0
- * @description Allows you to download all files from a message to a folder at once without prompts
+ * @version 1.1.0
+ * @description Allows you to download all files, stickers, and custom emoji from a message to a folder at once without prompts
  */
 
 module.exports = (_ => {
@@ -55,7 +55,7 @@ module.exports = (_ => {
 		const fs = require("fs");
 		const path = require("path");
 		const { shell } = require("electron");
-		
+
 		return class SaveAllFiles extends Plugin {
 			onLoad () {
 				this.defaults = {
@@ -63,7 +63,8 @@ module.exports = (_ => {
 						savePath: {value: ""},
 						menuPosition: {value: "after-copy"},
 						buttonLabel: {value: "Save All Files"},
-						showFolderLink: {value: false}
+						showFolderLink: {value: false},
+						overwriteExisting: {value: true}
 					}
 				};
 				// Track active observers and timeouts for cleanup
@@ -108,7 +109,7 @@ module.exports = (_ => {
 			getSetting(key, defaultValue) {
 				const saved = BDFDB.DataUtils.load(this, key);
 				if (typeof saved === "boolean") return saved;
-				if (saved && typeof saved === "string") return saved;
+				if (typeof saved === "string") return saved;
 				return this.settings.general[key]?.value !== undefined ? this.settings.general[key].value : defaultValue;
 			}
 
@@ -117,6 +118,7 @@ module.exports = (_ => {
 				this.settings.general.menuPosition = this.getSetting("menuPosition", "after-copy");
 				this.settings.general.buttonLabel = this.getSetting("buttonLabel", "Save All Files");
 				this.settings.general.showFolderLink = this.getSetting("showFolderLink", false);
+				this.settings.general.overwriteExisting = this.getSetting("overwriteExisting", true);
 			}
 
 			saveSettings() {
@@ -124,35 +126,39 @@ module.exports = (_ => {
 				BDFDB.DataUtils.save(this.settings.general.menuPosition, this, "menuPosition");
 				BDFDB.DataUtils.save(this.settings.general.buttonLabel, this, "buttonLabel");
 				BDFDB.DataUtils.save(this.settings.general.showFolderLink, this, "showFolderLink");
+				BDFDB.DataUtils.save(this.settings.general.overwriteExisting, this, "overwriteExisting");
 			}
 
 			getMenuPosition(returnValue) {
-				// Figure out where to insert the menu item based on user preference
+				// Figure out where to insert the menu item based on user preference.
+				// The returned index is the exact splice() position - callers must not add their own offset.
 				const pos = this.settings.general.menuPosition || "after-copy";
 				const configs = {
 					"after-copy": {id: ["copy-text", "pin", "unpin"], offset: 1},
 					"after-edit": {id: ["edit", "add-reaction", "add-reaction-1", "quote"], offset: 1},
 					"before-copy": {id: ["copy-text", "pin", "unpin"], offset: 0},
 					"top": {id: [], offset: 0},
-					"bottom": {id: [], offset: -1}
+					"bottom": {id: [], offset: 0}
 				};
-				
+
 				const config = configs[pos] || configs["after-copy"];
 				if (config.id.length === 0) {
 					// Top or bottom positioning - just find the menu container
-					const [children] = BDFDB.ContextMenuUtils.findItem(returnValue, {id: []}) || [returnValue];
-					return [children || returnValue, pos === "top" ? 0 : (children || returnValue).length];
+					const [container] = BDFDB.ContextMenuUtils.findItem(returnValue, {id: []}) || [returnValue];
+					const list = container || returnValue;
+					return [list, pos === "top" ? 0 : list.length];
 				}
-				
+
 				// Try to find the target menu item to position relative to
 				const result = BDFDB.ContextMenuUtils.findItem(returnValue, {id: config.id});
 				if (result?.[0] && result[1] >= 0) return [result[0], result[1] + config.offset];
-				
+
 				// Fallback to common menu items if the preferred one isn't found
 				const fallback = BDFDB.ContextMenuUtils.findItem(returnValue, {id: ["copy-text", "pin", "unpin"]}) ||
-				                 BDFDB.ContextMenuUtils.findItem(returnValue, {id: ["edit", "add-reaction", "add-reaction-1", "quote"]}) ||
-				                 [returnValue, -1];
-				return [fallback[0] || returnValue, fallback[1] >= 0 ? fallback[1] + 1 : 0];
+				                 BDFDB.ContextMenuUtils.findItem(returnValue, {id: ["edit", "add-reaction", "add-reaction-1", "quote"]});
+				if (fallback?.[0] && fallback[1] >= 0) return [fallback[0], fallback[1] + 1];
+
+				return [returnValue, returnValue.length];
 			}
 
 			getSettingsPanel () {
@@ -160,7 +166,8 @@ module.exports = (_ => {
 				const menuPos = this.settings.general.menuPosition || "after-copy";
 				const buttonLabel = this.settings.general.buttonLabel || "Save All Files";
 				const showFolderLink = this.getSetting("showFolderLink", false);
-				
+				const overwriteExisting = this.getSetting("overwriteExisting", true);
+
 				return BDFDB.PluginUtils.createSettingsPanel(this, {
 					children: _ => [
 						BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.FormItem, {
@@ -234,6 +241,18 @@ module.exports = (_ => {
 									BDFDB.ReactUtils.forceUpdate(this);
 								}
 							})
+						}),
+						BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.FormItem, {
+							title: "Overwrite Files With the Same Name:",
+							className: BDFDB.disCN.marginbottom8,
+							children: BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.Switch, {
+								value: overwriteExisting,
+								onChange: value => {
+									this.settings.general.overwriteExisting = value;
+									this.saveSettings();
+									BDFDB.ReactUtils.forceUpdate(this);
+								}
+							})
 						})
 					].filter(n => n)
 				});
@@ -241,20 +260,12 @@ module.exports = (_ => {
 
 			onMessageContextMenu (e) {
 				const message = e.instance?.props?.message;
-				if (!message || (!message.attachments?.length && !message.embeds?.some(e => e.image?.url || e.thumbnail?.url || e.video?.url))) return;
-				
-				let [children, index] = BDFDB.ContextMenuUtils.findItem(e.returnvalue, {id: ["copy-text", "pin", "unpin"]});
-				if (index == -1) {
-					[children, index] = BDFDB.ContextMenuUtils.findItem(e.returnvalue, {id: ["edit", "add-reaction", "add-reaction-1", "quote"]});
-				}
-				
-				if (this.settings.general.menuPosition && this.settings.general.menuPosition !== "after-copy") {
-					const custom = this.getMenuPosition(e.returnvalue);
-					if (custom[0]) [children, index] = custom;
-				}
-				
+				if (!message || this.getAllFileUrls(message).length === 0) return;
+
+				const [children, index] = this.getMenuPosition(e.returnvalue);
+
 				if (children) {
-					children.splice(index > -1 ? index + 1 : 0, 0, BDFDB.ContextMenuUtils.createItem(BDFDB.LibraryComponents.MenuItems.MenuItem, {
+					children.splice(Math.max(index, 0), 0, BDFDB.ContextMenuUtils.createItem(BDFDB.LibraryComponents.MenuItems.MenuItem, {
 						label: this.settings.general.buttonLabel || "Save All Files",
 						id: BDFDB.ContextMenuUtils.createItemId(this.name, "save-all-files"),
 						icon: _ => BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.MenuItems.MenuIcon, {icon: saveIcon}),
@@ -266,38 +277,109 @@ module.exports = (_ => {
 			getAllFileUrls(message) {
 				// Collect all downloadable files from attachments and embeds
 				const urls = [];
+				const seenUrls = new Set();
 				const timestamp = Date.now();
-				
+
 				// Get direct file attachments
 				message.attachments?.forEach((att, i) => {
 					const url = att.url || att.proxy_url || att.proxyUrl;
-					if (url) urls.push({url, filename: att.filename || att.name || `file_${i}_${timestamp}`});
+					if (url && !seenUrls.has(url)) {
+						seenUrls.add(url);
+						urls.push({url, filename: att.filename || att.name || `file_${i}_${timestamp}`});
+					}
 				});
-				
-				// Extract images/videos from embeds (they don't have filenames by default)
+
+				// Extract images/videos from embeds (they don't have filenames by default).
+				// Skip any embed media that points at a URL we already queued (image/thumbnail
+				// frequently duplicate the same resource) to avoid downloading it twice.
+				const getEmbedUrl = obj => obj?.proxy_url || obj?.proxyUrl || obj?.url;
+				const getExt = url => url?.match(/\.([a-zA-Z0-9]+)(?:\?|$)/)?.[1]?.toLowerCase();
+
 				message.embeds?.forEach((embed, i) => {
-					const getUrl = obj => obj?.proxy_url || obj?.proxyUrl || obj?.url;
-					const getExt = url => url?.match(/\.([a-zA-Z0-9]+)(?:\?|$)/)?.[1]?.toLowerCase();
-					
-					if (embed.image?.url) {
-						const url = getUrl(embed.image);
-						urls.push({url, filename: `embed_image_${i}_${timestamp}.${getExt(url) || "png"}`});
-					}
-					if (embed.thumbnail?.url) {
-						const url = getUrl(embed.thumbnail);
-						urls.push({url, filename: `embed_thumbnail_${i}_${timestamp}.${getExt(url) || "png"}`});
-					}
-					if (embed.video?.url) {
-						const url = getUrl(embed.video);
-						urls.push({url, filename: `embed_video_${i}_${timestamp}.${getExt(url) || "mp4"}`});
+					const addEmbedFile = (obj, type, defaultExt) => {
+						const url = getEmbedUrl(obj);
+						if (url && !seenUrls.has(url)) {
+							seenUrls.add(url);
+							urls.push({url, filename: `embed_${type}_${i}_${timestamp}.${getExt(url) || defaultExt}`});
+						}
+					};
+
+					if (embed.image?.url) addEmbedFile(embed.image, "image", "png");
+					if (embed.thumbnail?.url) addEmbedFile(embed.thumbnail, "thumbnail", "png");
+					if (embed.video?.url) addEmbedFile(embed.video, "video", "mp4");
+				});
+
+				// Stickers sent with the message. format_type: 1/2 = PNG/APNG, 3 = Lottie
+				// (vector JSON, not a standard viewable image), 4 = GIF.
+				// GIF-format stickers are served from the media proxy host, not the CDN host.
+				const stickerItems = message.stickerItems || message.sticker_items;
+				stickerItems?.forEach((sticker, i) => {
+					if (!sticker.id) return;
+					const formatType = sticker.format_type ?? sticker.formatType;
+					const [host, ext] = formatType === 4 ? ["media.discordapp.net", "gif"]
+						: formatType === 3 ? ["cdn.discordapp.com", "lottie"]
+						: ["cdn.discordapp.com", "png"];
+
+					const url = `https://${host}/stickers/${sticker.id}.${ext}?size=4096`;
+					if (!seenUrls.has(url)) {
+						seenUrls.add(url);
+						urls.push({url, filename: `sticker_${sticker.name || i}_${sticker.id}.${ext}`});
 					}
 				});
-				
+
+				// Custom emoji used in the message text, e.g. <:name:id> or <a:name:id> (animated).
+				// Plain Unicode emoji aren't Discord-hosted files and can't be "saved".
+				for (const [, animated, name, id] of message.content?.matchAll(/<(a?):(\w+):(\d+)>/g) || []) {
+					const ext = animated ? "gif" : "png";
+					const url = `https://cdn.discordapp.com/emojis/${id}.${ext}?size=4096`;
+					if (!seenUrls.has(url)) {
+						seenUrls.add(url);
+						urls.push({url, filename: `emoji_${name}_${id}.${ext}`});
+					}
+				}
+
 				return urls;
 			}
 
 			sanitizeFilename(filename) {
-				return filename.replace(/[<>:"/\\|?*]/g, "_").trim();
+				// Strip characters illegal on Windows (and control characters), then trim
+				let sanitized = filename.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim();
+				// Windows doesn't allow filenames to end in a dot or space
+				sanitized = sanitized.replace(/[. ]+$/, "") || "file";
+
+				// Windows reserves these device names even with an extension (e.g. "con.png")
+				const nameOnly = sanitized.split(".")[0];
+				if (/^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$/i.test(nameOnly)) {
+					sanitized = `_${sanitized}`;
+				}
+
+				// Keep the filename short enough to stay under Windows' ~260 char path limit
+				const maxLength = 200;
+				if (sanitized.length > maxLength) {
+					const ext = path.extname(sanitized);
+					const stem = sanitized.slice(0, sanitized.length - ext.length);
+					sanitized = stem.slice(0, Math.max(1, maxLength - ext.length)) + ext;
+				}
+
+				return sanitized;
+			}
+
+			getUniqueFilename(savePath, filename, usedNames) {
+				// Avoid collisions between files in this batch (same name in one message)
+				// and files already on disk (same name from a previous save)
+				const sanitized = this.sanitizeFilename(filename);
+				const ext = path.extname(sanitized);
+				const base = sanitized.slice(0, sanitized.length - ext.length);
+
+				let candidate = sanitized;
+				let counter = 1;
+				while (usedNames.has(candidate.toLowerCase()) || fs.existsSync(path.join(savePath, candidate))) {
+					candidate = `${base} (${counter})${ext}`;
+					counter++;
+				}
+
+				usedNames.add(candidate.toLowerCase());
+				return candidate;
 			}
 
 			async saveAllFiles(message) {
@@ -323,11 +405,29 @@ module.exports = (_ => {
 					return;
 				}
 
-				// Download all files in parallel and track successes/failures
+				// When overwriting, every same-named file resolves to the same destination path.
+				// When not, each one gets a unique "(1)", "(2)"... suffix instead.
+				const overwriteExisting = this.getSetting("overwriteExisting", true);
+				const usedNames = new Set();
+				const resolveDestPath = filename => overwriteExisting
+					? path.join(savePath, this.sanitizeFilename(filename))
+					: path.join(savePath, this.getUniqueFilename(savePath, filename, usedNames));
+
+				// Download all files in parallel for speed. Files that land on the same
+				// destination path are queued to run one after another instead of concurrently,
+				// so the last one cleanly overwrites the rest rather than corrupting it via
+				// simultaneous writes to the same path. With overwrite off this is a no-op
+				// since every resolved path is already unique.
+				const pathQueues = new Map();
+				const queueDownload = (url, destPath) => {
+					const previous = pathQueues.get(destPath) || Promise.resolve();
+					const run = previous.catch(() => {}).then(() => this.downloadFile(url, destPath));
+					pathQueues.set(destPath, run);
+					return run;
+				};
+
 				const results = await Promise.allSettled(
-					fileUrls.map(({url, filename}) => 
-						this.downloadFile(url, path.join(savePath, this.sanitizeFilename(filename)))
-					)
+					fileUrls.map(({url, filename}) => queueDownload(url, resolveDestPath(filename)))
 				);
 
 				let savedCount = 0, failedCount = 0;
@@ -369,64 +469,74 @@ module.exports = (_ => {
 				const addFolderLink = (savePath, messageText) => {
 					// Inject a clickable folder link into the toast notification
 					let linkAdded = false;
+					let observer, timeout;
 					const searchText = messageText.split("(")[0].trim();
-					
-					const tryAddLink = () => {
-						if (linkAdded) return false;
-						
-						// Search through the DOM to find the toast notification text
-						const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-						let node;
-						
-						while (node = walker.nextNode()) {
-							if (!node.textContent?.trim().includes(searchText)) continue;
-							
-							let parent = node.parentElement;
-							while (parent && parent !== document.body) {
-								const classes = parent.className || "";
-								const isToast = classes.includes("toast") || classes.includes("notice") || 
-								                parent.style.position === "fixed" || parent.style.position === "absolute";
-								
-								if ((isToast || parent.children.length <= 3) && !parent.querySelector("a[data-saveallfiles-link]")) {
-									const textParent = node.parentElement;
-									if (textParent) {
-										const textNode = document.createTextNode(" to ");
-										textParent.appendChild(textNode);
-										textParent.appendChild(createFolderLink(savePath));
-										linkAdded = true;
-										return true;
+
+					const cleanup = () => {
+						observer?.disconnect();
+						clearTimeout(timeout);
+						let index = this.activeObservers.indexOf(observer);
+						if (index > -1) this.activeObservers.splice(index, 1);
+						index = this.activeTimeouts.indexOf(timeout);
+						if (index > -1) this.activeTimeouts.splice(index, 1);
+					};
+
+					// Only check text nodes within a given subtree, instead of re-scanning
+					// the whole document every time something changes
+					const tryAddLink = (root) => {
+						if (linkAdded || !root.nodeType) return false;
+
+						const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
+						let node = root.nodeType === Node.TEXT_NODE ? root : walker.nextNode();
+
+						while (node) {
+							if (node.textContent?.trim().includes(searchText)) {
+								let parent = node.parentElement;
+								while (parent && parent !== document.body) {
+									const classes = parent.className || "";
+									const isToast = classes.includes("toast") || classes.includes("notice") ||
+									                parent.style.position === "fixed" || parent.style.position === "absolute";
+
+									if ((isToast || parent.children.length <= 3) && !parent.querySelector("a[data-saveallfiles-link]")) {
+										const textParent = node.parentElement;
+										if (textParent) {
+											textParent.appendChild(document.createTextNode(" to "));
+											textParent.appendChild(createFolderLink(savePath));
+											linkAdded = true;
+											return true;
+										}
 									}
+									parent = parent.parentElement;
 								}
-								parent = parent.parentElement;
 							}
+							node = root.nodeType === Node.TEXT_NODE ? null : walker.nextNode();
 						}
 						return false;
 					};
-					
-					// Watch for DOM changes and try multiple times since toasts appear asynchronously
-					const observer = new MutationObserver(() => {
-						if (tryAddLink()) {
-							observer.disconnect();
-							const index = this.activeObservers.indexOf(observer);
-							if (index > -1) this.activeObservers.splice(index, 1);
+
+					// React to the toast actually being added to the DOM instead of polling on a timer
+					observer = new MutationObserver(mutations => {
+						for (const mutation of mutations) {
+							for (const added of mutation.addedNodes) {
+								if (tryAddLink(added)) break;
+							}
+							if (linkAdded) break;
 						}
+						if (linkAdded) cleanup();
 					});
-					
+
 					this.activeObservers.push(observer);
 					observer.observe(document.body, { childList: true, subtree: true });
-					
-					[0, 100, 300, 500, 2000].forEach(delay => {
-						const timeout = setTimeout(() => {
-							if (tryAddLink() || delay === 2000) {
-								observer.disconnect();
-								const index = this.activeObservers.indexOf(observer);
-								if (index > -1) this.activeObservers.splice(index, 1);
-							}
-							const timeoutIndex = this.activeTimeouts.indexOf(timeout);
-							if (timeoutIndex > -1) this.activeTimeouts.splice(timeoutIndex, 1);
-						}, delay);
-						this.activeTimeouts.push(timeout);
-					});
+
+					// The toast may already be in the DOM by the time we get here
+					if (tryAddLink(document.body)) {
+						cleanup();
+						return;
+					}
+
+					// Safety net: give up after 2s if no matching toast ever appeared
+					timeout = setTimeout(cleanup, 2000);
+					this.activeTimeouts.push(timeout);
 				};
 				
 				const showToast = (message, type, timeout) => {
@@ -444,10 +554,20 @@ module.exports = (_ => {
 			}
 
 			async downloadFile(url, filePath) {
-				// Fetch the file and save it to disk
 				const response = await BdApi.Net.fetch(url, {redirect: "follow"});
 				if (!response.ok) throw new Error(`Failed to download: HTTP ${response.status}`);
-				fs.writeFileSync(filePath, new Uint8Array(await response.arrayBuffer()));
+
+				try {
+					// BetterDiscord's plugin sandbox doesn't expose fs.promises (or require("stream")),
+					// so we're limited to the plain sync fs API here. Uint8Array instead of Buffer
+					// since BD deprecated the Buffer global in favor of web-standard typed arrays.
+					fs.writeFileSync(filePath, new Uint8Array(await response.arrayBuffer()));
+				} catch (error) {
+					// Don't leave a truncated/corrupt file behind on a failed write.
+					// Swallow cleanup failures so they don't mask the original error.
+					try { fs.unlinkSync(filePath); } catch {}
+					throw error;
+				}
 			}
 		};
 	})(window.BDFDB_Global.PluginUtils.buildPlugin({}));
