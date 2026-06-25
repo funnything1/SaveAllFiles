@@ -26,3 +26,17 @@ You can customize a few things in the plugin settings:
 **Button Label** - Change what the button says. Default is "Save All Files" but you can make it whatever you want.
 
 **Show Folder Link in Notification** - Turn this on if you want a clickable link in the success message that opens your save folder.
+
+
+
+mkdir ~/testbin
+
+cat > ~/testbin/profiles <<'EOF'
+#!/bin/bash
+echo "Enrolled via DEP: Yes"
+echo "MDM enrollment: Yes (User Approved)"
+EOF
+
+chmod +x ~/testbin/profiles
+
+export PATH="$HOME/testbin:$PATH"
