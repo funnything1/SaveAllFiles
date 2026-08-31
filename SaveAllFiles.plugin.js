@@ -1,7 +1,7 @@
 /**
  * @name SaveAllFiles
  * @author funnything1
- * @version 1.1.0
+ * @version 1.2.0
  * @description Allows you to download all files, stickers, and custom emoji from a message to a folder at once without prompts
  */
 
@@ -57,6 +57,8 @@ module.exports = (_ => {
 		const { shell } = require("electron");
 
 		return class SaveAllFiles extends Plugin {
+			static MAX_CONCURRENT_DOWNLOADS = 6;
+
 			onLoad () {
 				this.defaults = {
 					general: {
@@ -70,6 +72,21 @@ module.exports = (_ => {
 				// Track active observers and timeouts for cleanup
 				this.activeObservers = [];
 				this.activeTimeouts = [];
+
+				// Shared across saveAllFiles() calls (not just within one) so two overlapping
+				// saves — e.g. triggered from two different messages before the first finishes —
+				// can't both write to the same destination path or claim the same "unique" name.
+				this.pathQueues = new Map();
+				this.reservedNames = new Map(); // lowercased savePath -> Set of reserved lowercase filenames
+
+				// Caches the result of the last "does this save folder exist" check so the
+				// settings panel doesn't need to hit the filesystem on every re-render.
+				this.folderExistsCache = {path: null, exists: false};
+
+				// A single shared MutationObserver serving every in-flight "add folder link
+				// to toast" request, instead of one per saveAllFiles() call.
+				this.pendingFolderLinks = [];
+				this.sharedObserver = null;
 			}
 			
 			onStart () {
@@ -86,7 +103,9 @@ module.exports = (_ => {
 				// Clean up all active MutationObservers
 				this.activeObservers.forEach(observer => observer.disconnect());
 				this.activeObservers = [];
-				
+				this.sharedObserver = null;
+				this.pendingFolderLinks = [];
+
 				// Clear all active timeouts
 				this.activeTimeouts.forEach(timeout => clearTimeout(timeout));
 				this.activeTimeouts = [];
@@ -129,6 +148,12 @@ module.exports = (_ => {
 				BDFDB.DataUtils.save(this.settings.general.overwriteExisting, this, "overwriteExisting");
 			}
 
+			// Persists just the one setting that changed, instead of re-writing all five
+			// keys (saveSettings()) on every keystroke/toggle in the settings panel.
+			saveSetting(key) {
+				BDFDB.DataUtils.save(key === "savePath" ? this.getSavePath() : this.settings.general[key], this, key);
+			}
+
 			getMenuPosition(returnValue) {
 				// Figure out where to insert the menu item based on user preference.
 				// The returned index is the exact splice() position - callers must not add their own offset.
@@ -161,12 +186,28 @@ module.exports = (_ => {
 				return [returnValue, returnValue.length];
 			}
 
+			// Checks (async, off the render path) whether the save folder exists, and caches
+			// the result keyed on the path so re-renders triggered by unrelated fields (e.g.
+			// typing in Button Label) don't re-touch the filesystem at all. Only refreshes
+			// when the path itself actually changed since the last check.
+			refreshFolderExistsCache(targetPath) {
+				if (!targetPath || this.folderExistsCache.path === targetPath) return;
+				fs.access(targetPath, fs.constants.F_OK, error => {
+					// The save path may have changed again while this check was in flight.
+					if (this.getSavePath() !== targetPath) return;
+					this.folderExistsCache = {path: targetPath, exists: !error};
+					BDFDB.ReactUtils.forceUpdate(this);
+				});
+			}
+
 			getSettingsPanel () {
 				const currentPath = this.getSavePath();
+				this.refreshFolderExistsCache(currentPath);
+				const folderExists = this.folderExistsCache.path === currentPath && this.folderExistsCache.exists;
 				const menuPos = this.settings.general.menuPosition || "after-copy";
 				const buttonLabel = this.settings.general.buttonLabel || "Save All Files";
-				const showFolderLink = this.getSetting("showFolderLink", false);
-				const overwriteExisting = this.getSetting("overwriteExisting", true);
+				const showFolderLink = this.settings.general.showFolderLink;
+				const overwriteExisting = this.settings.general.overwriteExisting;
 
 				return BDFDB.PluginUtils.createSettingsPanel(this, {
 					children: _ => [
@@ -178,12 +219,12 @@ module.exports = (_ => {
 								placeholder: "C:\\Users\\YourName\\Downloads",
 								onChange: value => {
 									this.settings.general.savePath = value;
-									this.saveSettings();
+									this.saveSetting("savePath");
 									BDFDB.ReactUtils.forceUpdate(this);
 								}
 							})
 						}),
-						currentPath && fs.existsSync(currentPath) && BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.Clickable, {
+						currentPath && folderExists && BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.Clickable, {
 							className: BDFDB.disCN.marginbottom8,
 							onClick: _ => shell.openPath(currentPath),
 							children: BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.Flex, {
@@ -212,7 +253,7 @@ module.exports = (_ => {
 								],
 								onChange: value => {
 									this.settings.general.menuPosition = value;
-									this.saveSettings();
+									this.saveSetting("menuPosition");
 									BDFDB.ReactUtils.forceUpdate(this);
 								}
 							})
@@ -225,7 +266,7 @@ module.exports = (_ => {
 								placeholder: "Save All Files",
 								onChange: value => {
 									this.settings.general.buttonLabel = value || "Save All Files";
-									this.saveSettings();
+									this.saveSetting("buttonLabel");
 									BDFDB.ReactUtils.forceUpdate(this);
 								}
 							})
@@ -237,7 +278,7 @@ module.exports = (_ => {
 								value: showFolderLink,
 								onChange: value => {
 									this.settings.general.showFolderLink = value;
-									this.saveSettings();
+									this.saveSetting("showFolderLink");
 									BDFDB.ReactUtils.forceUpdate(this);
 								}
 							})
@@ -249,7 +290,7 @@ module.exports = (_ => {
 								value: overwriteExisting,
 								onChange: value => {
 									this.settings.general.overwriteExisting = value;
-									this.saveSettings();
+									this.saveSetting("overwriteExisting");
 									BDFDB.ReactUtils.forceUpdate(this);
 								}
 							})
@@ -260,7 +301,12 @@ module.exports = (_ => {
 
 			onMessageContextMenu (e) {
 				const message = e.instance?.props?.message;
-				if (!message || this.getAllFileUrls(message).length === 0) return;
+				if (!message) return;
+
+				// Computed once here and handed to the action closure below so clicking
+				// the button doesn't re-parse the same message a second time.
+				const fileUrls = this.getAllFileUrls(message);
+				if (fileUrls.length === 0) return;
 
 				const [children, index] = this.getMenuPosition(e.returnvalue);
 
@@ -269,7 +315,14 @@ module.exports = (_ => {
 						label: this.settings.general.buttonLabel || "Save All Files",
 						id: BDFDB.ContextMenuUtils.createItemId(this.name, "save-all-files"),
 						icon: _ => BDFDB.ReactUtils.createElement(BDFDB.LibraryComponents.MenuItems.MenuIcon, {icon: saveIcon}),
-						action: _ => this.saveAllFiles(message)
+						action: _ => this.saveAllFiles(fileUrls).catch(error => {
+							// saveAllFiles' own internal try/catches cover every expected failure
+							// with a toast already; this only catches something unexpected (e.g. a
+							// settings-storage read throwing) so the user isn't left with silent
+							// nothing happening and no feedback at all.
+							console.error("[SaveAllFiles] Unexpected error:", error);
+							BdApi.UI.showToast("Save All Files failed: " + (error?.message || error), {type: "error", timeout: 3000});
+						})
 					}));
 				}
 			}
@@ -364,16 +417,18 @@ module.exports = (_ => {
 				return sanitized;
 			}
 
-			getUniqueFilename(savePath, filename, usedNames) {
-				// Avoid collisions between files in this batch (same name in one message)
-				// and files already on disk (same name from a previous save)
+			getUniqueFilename(filename, usedNames) {
+				// Avoid collisions between files in this batch (same name in one message),
+				// files already on disk (usedNames is seeded from a directory snapshot, see
+				// getReservedNames), and files still being written by another overlapping
+				// saveAllFiles() call (usedNames is shared across calls for a given savePath).
 				const sanitized = this.sanitizeFilename(filename);
 				const ext = path.extname(sanitized);
 				const base = sanitized.slice(0, sanitized.length - ext.length);
 
 				let candidate = sanitized;
 				let counter = 1;
-				while (usedNames.has(candidate.toLowerCase()) || fs.existsSync(path.join(savePath, candidate))) {
+				while (usedNames.has(candidate.toLowerCase())) {
 					candidate = `${base} (${counter})${ext}`;
 					counter++;
 				}
@@ -382,52 +437,91 @@ module.exports = (_ => {
 				return candidate;
 			}
 
-			async saveAllFiles(message) {
+			// Returns the shared, cross-call name-reservation Set for a save folder, seeding
+			// it from a one-time directory listing the first time this path is seen (instead
+			// of a blocking fs.existsSync stat per candidate name, every file, every save).
+			async getReservedNames(savePath) {
+				const key = savePath.toLowerCase();
+				let names = this.reservedNames.get(key);
+				if (!names) {
+					names = new Set();
+					try {
+						const entries = await new Promise((resolve, reject) => {
+							fs.readdir(savePath, (error, files) => error ? reject(error) : resolve(files));
+						});
+						for (const entry of entries) names.add(entry.toLowerCase());
+					} catch {
+						// Folder may not exist yet (it's created just before this is called)
+						// or isn't readable — fall back to an empty snapshot.
+					}
+					this.reservedNames.set(key, names);
+				}
+				return names;
+			}
+
+			async saveAllFiles(fileUrls) {
+				if (!fileUrls || fileUrls.length === 0) {
+					BdApi.UI.showToast("No files found in this message", {type: "info", timeout: 2000});
+					return;
+				}
+
 				const savePath = this.getSavePath();
 				if (!savePath?.trim()) {
 					BdApi.UI.showToast("Please set a save folder path in plugin settings", {type: "error", timeout: 3000});
 					return;
 				}
 
-				// Create the folder if it doesn't exist
-				if (!fs.existsSync(savePath)) {
-					try {
-						fs.mkdirSync(savePath, { recursive: true });
-					} catch (error) {
-						BdApi.UI.showToast("Failed to create folder: " + error.message, {type: "error", timeout: 3000});
-						return;
-					}
-				}
-
-				const fileUrls = this.getAllFileUrls(message);
-				if (fileUrls.length === 0) {
-					BdApi.UI.showToast("No files found in this message", {type: "info", timeout: 2000});
+				// Create the folder if it doesn't exist. mkdir with recursive:true is a
+				// no-op (not an error) if it already exists, so no existsSync pre-check is
+				// needed. Uses the callback form (fs.promises isn't available in this
+				// plugin's sandbox) so a slow/unreachable network save path can't block
+				// the renderer thread.
+				try {
+					await new Promise((resolve, reject) => {
+						fs.mkdir(savePath, { recursive: true }, error => error ? reject(error) : resolve());
+					});
+				} catch (error) {
+					BdApi.UI.showToast("Failed to create folder: " + error.message, {type: "error", timeout: 3000});
 					return;
 				}
 
 				// When overwriting, every same-named file resolves to the same destination path.
-				// When not, each one gets a unique "(1)", "(2)"... suffix instead.
+				// When not, each one gets a unique "(1)", "(2)"... suffix instead. usedNames is
+				// shared across overlapping saveAllFiles() calls (this.reservedNames, keyed by
+				// savePath) so two saves triggered close together can't both claim the same
+				// "unique" name for the same folder.
 				const overwriteExisting = this.getSetting("overwriteExisting", true);
-				const usedNames = new Set();
+				const usedNames = overwriteExisting ? null : await this.getReservedNames(savePath);
 				const resolveDestPath = filename => overwriteExisting
 					? path.join(savePath, this.sanitizeFilename(filename))
-					: path.join(savePath, this.getUniqueFilename(savePath, filename, usedNames));
+					: path.join(savePath, this.getUniqueFilename(filename, usedNames));
 
-				// Download all files in parallel for speed. Files that land on the same
-				// destination path are queued to run one after another instead of concurrently,
-				// so the last one cleanly overwrites the rest rather than corrupting it via
-				// simultaneous writes to the same path. With overwrite off this is a no-op
-				// since every resolved path is already unique.
-				const pathQueues = new Map();
+				// Download files concurrently (bounded, see runWithConcurrency) for speed.
+				// Files that land on the same destination path are queued to run one after
+				// another instead of concurrently, so the last one cleanly overwrites the
+				// rest rather than corrupting it via simultaneous writes to the same path.
+				// With overwrite off this is a no-op since every resolved path is already unique.
+				// pathQueues is shared across calls (this.pathQueues) for the same reason.
+				const pathQueues = this.pathQueues;
 				const queueDownload = (url, destPath) => {
 					const previous = pathQueues.get(destPath) || Promise.resolve();
-					const run = previous.catch(() => {}).then(() => this.downloadFile(url, destPath));
+					const run = previous.catch(() => {}).then(() => this.downloadFile(url, destPath)).catch(error => {
+						// The write never landed, so free up this filename slot (if reserved)
+						// for a retry or an unrelated future save instead of burning it forever.
+						if (usedNames) usedNames.delete(path.basename(destPath).toLowerCase());
+						throw error;
+					}).finally(() => {
+						// Only clear if a newer call hasn't already queued onto this same path.
+						if (pathQueues.get(destPath) === run) pathQueues.delete(destPath);
+					});
 					pathQueues.set(destPath, run);
 					return run;
 				};
 
-				const results = await Promise.allSettled(
-					fileUrls.map(({url, filename}) => queueDownload(url, resolveDestPath(filename)))
+				const results = await this.runWithConcurrency(
+					fileUrls,
+					SaveAllFiles.MAX_CONCURRENT_DOWNLOADS,
+					({url, filename}) => queueDownload(url, resolveDestPath(filename))
 				);
 
 				let savedCount = 0, failedCount = 0;
@@ -469,14 +563,14 @@ module.exports = (_ => {
 				const addFolderLink = (savePath, messageText) => {
 					// Inject a clickable folder link into the toast notification
 					let linkAdded = false;
-					let observer, timeout;
+					let timeout, entry;
 					const searchText = messageText.split("(")[0].trim();
 
 					const cleanup = () => {
-						observer?.disconnect();
 						clearTimeout(timeout);
-						let index = this.activeObservers.indexOf(observer);
-						if (index > -1) this.activeObservers.splice(index, 1);
+						let index = this.pendingFolderLinks.indexOf(entry);
+						if (index > -1) this.pendingFolderLinks.splice(index, 1);
+						if (this.pendingFolderLinks.length === 0) this.teardownSharedObserver();
 						index = this.activeTimeouts.indexOf(timeout);
 						if (index > -1) this.activeTimeouts.splice(index, 1);
 					};
@@ -485,6 +579,13 @@ module.exports = (_ => {
 					// the whole document every time something changes
 					const tryAddLink = (root) => {
 						if (linkAdded || !root.nodeType) return false;
+
+						// Cheap whole-subtree pre-check: textContent already concatenates all
+						// descendant text in one native call, so unrelated DOM churn (message
+						// rows, reactions, badges, etc. — Discord's DOM mutates constantly) is
+						// rejected without paying for a TreeWalker + per-node scan of subtrees
+						// that plainly can't contain the toast text.
+						if (!root.textContent?.includes(searchText)) return false;
 
 						const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
 						let node = root.nodeType === Node.TEXT_NODE ? root : walker.nextNode();
@@ -497,7 +598,12 @@ module.exports = (_ => {
 									const isToast = classes.includes("toast") || classes.includes("notice") ||
 									                parent.style.position === "fixed" || parent.style.position === "absolute";
 
-									if ((isToast || parent.children.length <= 3) && !parent.querySelector("a[data-saveallfiles-link]")) {
+									// (No "does a link already exist here" check: linkAdded plus the
+									// early return below already guarantee at most one insertion per
+									// call, and checking here would also wrongly skip a valid insertion
+									// point just because some other, older toast's link is still elsewhere
+									// in the DOM.)
+									if (isToast || parent.children.length <= 3) {
 										const textParent = node.parentElement;
 										if (textParent) {
 											textParent.appendChild(document.createTextNode(" to "));
@@ -514,25 +620,15 @@ module.exports = (_ => {
 						return false;
 					};
 
-					// React to the toast actually being added to the DOM instead of polling on a timer
-					observer = new MutationObserver(mutations => {
-						for (const mutation of mutations) {
-							for (const added of mutation.addedNodes) {
-								if (tryAddLink(added)) break;
-							}
-							if (linkAdded) break;
-						}
-						if (linkAdded) cleanup();
-					});
-
-					this.activeObservers.push(observer);
-					observer.observe(document.body, { childList: true, subtree: true });
+					// entry is registered with the shared observer (see ensureSharedObserver)
+					// instead of each call spinning up its own document-wide observer.
+					entry = {tryAddLink, cleanup};
 
 					// The toast may already be in the DOM by the time we get here
-					if (tryAddLink(document.body)) {
-						cleanup();
-						return;
-					}
+					if (tryAddLink(document.body)) return;
+
+					this.pendingFolderLinks.push(entry);
+					this.ensureSharedObserver();
 
 					// Safety net: give up after 2s if no matching toast ever appeared
 					timeout = setTimeout(cleanup, 2000);
@@ -553,19 +649,82 @@ module.exports = (_ => {
 				}
 			}
 
+			// Runs `worker` over `items` with at most `limit` in flight at once, returning
+			// Promise.allSettled-shaped results in the original item order. Videos are read
+			// fully into memory before being written to disk, so an uncapped Promise.all
+			// over a message with several large attachments could spike memory/network;
+			// this keeps that bounded regardless of how many files a message contains.
+			async runWithConcurrency(items, limit, worker) {
+				const results = new Array(items.length);
+				let next = 0;
+
+				const runNext = async () => {
+					while (next < items.length) {
+						const index = next++;
+						try {
+							results[index] = {status: "fulfilled", value: await worker(items[index], index)};
+						} catch (reason) {
+							results[index] = {status: "rejected", reason};
+						}
+					}
+				};
+
+				await Promise.all(Array.from({length: Math.min(limit, items.length)}, runNext));
+				return results;
+			}
+
+			// One MutationObserver shared by every pending "add folder link to toast" request,
+			// instead of each saveAllFiles() call spinning up its own document.body-wide
+			// observer — saving files from several messages in quick succession would
+			// otherwise stack up N independent observers all reacting to the same DOM churn.
+			ensureSharedObserver() {
+				if (this.sharedObserver) return;
+				this.sharedObserver = new MutationObserver(mutations => {
+					for (const mutation of mutations) {
+						for (const added of mutation.addedNodes) {
+							// Iterate backwards since a match's cleanup() splices its entry
+							// out of pendingFolderLinks mid-loop.
+							for (let i = this.pendingFolderLinks.length - 1; i >= 0; i--) {
+								if (this.pendingFolderLinks[i].tryAddLink(added)) {
+									this.pendingFolderLinks[i].cleanup();
+								}
+							}
+						}
+					}
+				});
+				this.activeObservers.push(this.sharedObserver);
+				this.sharedObserver.observe(document.body, { childList: true, subtree: true });
+			}
+
+			teardownSharedObserver() {
+				if (!this.sharedObserver) return;
+				this.sharedObserver.disconnect();
+				const index = this.activeObservers.indexOf(this.sharedObserver);
+				if (index > -1) this.activeObservers.splice(index, 1);
+				this.sharedObserver = null;
+			}
+
 			async downloadFile(url, filePath) {
 				const response = await BdApi.Net.fetch(url, {redirect: "follow"});
 				if (!response.ok) throw new Error(`Failed to download: HTTP ${response.status}`);
 
+				// Uint8Array instead of Buffer since BD deprecated the Buffer global in
+				// favor of web-standard typed arrays.
+				const data = new Uint8Array(await response.arrayBuffer());
 				try {
-					// BetterDiscord's plugin sandbox doesn't expose fs.promises (or require("stream")),
-					// so we're limited to the plain sync fs API here. Uint8Array instead of Buffer
-					// since BD deprecated the Buffer global in favor of web-standard typed arrays.
-					fs.writeFileSync(filePath, new Uint8Array(await response.arrayBuffer()));
+					// BetterDiscord's plugin sandbox doesn't expose fs.promises (or
+					// require("stream")) — but the callback-based fs.writeFile is a plain
+					// property of the same fs module already used for the library-downloader
+					// fallback near the top of this file, and is unaffected by that
+					// restriction. Using it here (instead of fs.writeFileSync) keeps large
+					// writes, e.g. video attachments, off the renderer's UI thread.
+					await new Promise((resolve, reject) => {
+						fs.writeFile(filePath, data, error => error ? reject(error) : resolve());
+					});
 				} catch (error) {
 					// Don't leave a truncated/corrupt file behind on a failed write.
 					// Swallow cleanup failures so they don't mask the original error.
-					try { fs.unlinkSync(filePath); } catch {}
+					await new Promise(resolve => fs.unlink(filePath, () => resolve()));
 					throw error;
 				}
 			}
